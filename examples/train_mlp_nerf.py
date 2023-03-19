@@ -35,6 +35,12 @@ parser.add_argument(
     help="which train split to use",
 )
 parser.add_argument(
+    "--model_path",
+    type=str,
+    default=None,
+    help="the data path of the pretrained model",
+)
+parser.add_argument(
     "--scene",
     type=str,
     default="lego",
@@ -54,6 +60,13 @@ parser.add_argument(
     help="which scene to use",
 )
 parser.add_argument(
+    "--dataset_type",
+    type=str,
+    default="blender",
+    choices=["blender", "llff", "360"],
+    help="which kind of dataset to use",
+)
+parser.add_argument(
     "--aabb",
     type=lambda s: [float(item) for item in s.split(",")],
     default="-1.5,-1.5,-1.5,1.5,1.5,1.5",
@@ -69,16 +82,78 @@ parser.add_argument(
     action="store_true",
     help="whether to use unbounded rendering",
 )
+parser.add_argument(
+    "--auto_aabb",
+    action="store_true",
+    help="whether to automatically compute the aabb",
+)
 parser.add_argument("--cone_angle", type=float, default=0.0)
 args = parser.parse_args()
 
 render_n_samples = 1024
 
+# setup the dataset
+train_dataset_kwargs = {}
+test_dataset_kwargs = {}
+
+if args.dataset_type == "llff":
+    train_dataset_kwargs["ndc"] = True
+    test_dataset_kwargs["ndc"] = True
+
+if args.dataset_type == "llff" or args.dataset_type == "360":
+    from datasets.nerf_360_v2 import SubjectLoader
+
+    target_sample_batch_size = 1 << 16
+    train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 4}
+    test_dataset_kwargs = {"factor": 4}
+    grid_resolution = 128
+else:
+    from datasets.nerf_synthetic import SubjectLoader
+
+    target_sample_batch_size = 1 << 16
+    grid_resolution = 128
+
+train_dataset = SubjectLoader(
+    subject_id=args.scene,
+    root_fp=args.data_root,
+    split=args.train_split,
+    num_rays=target_sample_batch_size // render_n_samples,
+    **train_dataset_kwargs,
+)
+
+test_dataset = SubjectLoader(
+    subject_id=args.scene,
+    root_fp=args.data_root,
+    split="test",
+    num_rays=None,
+    **test_dataset_kwargs,
+)
+
+if args.auto_aabb:
+    if train_dataset_kwargs["ndc"]:
+        train_aabb = train_dataset.cal_ndc_aabb()
+        test_aabb = test_dataset.cal_ndc_aabb()
+        args.aabb = [min(x, y) for x, y in zip(train_aabb[:3], test_aabb[:3])] + [max(x, y) for x, y in zip(train_aabb[3:], test_aabb[3:])]
+    else:
+        camera_locs = torch.cat(
+            [train_dataset.camtoworlds, test_dataset.camtoworlds]
+        )[:, :3, -1]
+        args.aabb = torch.cat(
+            [camera_locs.min(dim=0).values, camera_locs.max(dim=0).values]
+        ).tolist()
+    print("Using auto aabb", args.aabb)
+
 # setup the scene bounding box.
-if args.unbounded:
+if args.dataset_type == "llff":
+    print("Using faceforwarding rendering")
+    contraction_type = ContractionType.AABB
+    scene_aabb = None
+    near_plane = 0.01
+    far_plane = 1
+    render_step_size = 2 / render_n_samples
+elif args.unbounded:
     print("Using unbounded rendering")
     contraction_type = ContractionType.UN_BOUNDED_SPHERE
-    # contraction_type = ContractionType.UN_BOUNDED_TANH
     scene_aabb = None
     near_plane = 0.2
     far_plane = 1e4
@@ -110,46 +185,23 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(
     gamma=0.33,
 )
 
-# setup the dataset
-train_dataset_kwargs = {}
-test_dataset_kwargs = {}
-if args.scene == "garden":
-    from datasets.nerf_360_v2 import SubjectLoader
-
-    target_sample_batch_size = 1 << 16
-    train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 4}
-    test_dataset_kwargs = {"factor": 4}
-    grid_resolution = 128
-else:
-    from datasets.nerf_synthetic import SubjectLoader
-
-    target_sample_batch_size = 1 << 16
-    grid_resolution = 128
-
-train_dataset = SubjectLoader(
-    subject_id=args.scene,
-    root_fp=args.data_root,
-    split=args.train_split,
-    num_rays=target_sample_batch_size // render_n_samples,
-    **train_dataset_kwargs,
-)
-
-test_dataset = SubjectLoader(
-    subject_id=args.scene,
-    root_fp=args.data_root,
-    split="test",
-    num_rays=None,
-    **test_dataset_kwargs,
-)
-
 occupancy_grid = OccupancyGrid(
     roi_aabb=args.aabb,
     resolution=grid_resolution,
     contraction_type=contraction_type,
 ).to(device)
 
+if args.model_path is not None:
+    checkpoint = torch.load(args.model_path)
+    radiance_field.load_state_dict(checkpoint['radiance_field_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    occupancy_grid.load_state_dict(checkpoint['occupancy_grid_state_dict'])
+    step = checkpoint['step']
+else:
+    step = 0
+
 # training
-step = 0
 tic = time.time()
 for epoch in range(10000000):
     for i in range(len(train_dataset)):
@@ -245,10 +297,10 @@ for epoch in range(10000000):
                     #     "acc_binary_test.png",
                     #     ((acc > 0).float().cpu().numpy() * 255).astype(np.uint8),
                     # )
-                    # imageio.imwrite(
-                    #     "rgb_test.png",
-                    #     (rgb.cpu().numpy() * 255).astype(np.uint8),
-                    # )
+                    imageio.imwrite(
+                        f"rgb_test_{step}_{i}.png",
+                        (rgb.cpu().numpy() * 255).astype(np.uint8),
+                    )
                     # break
             psnr_avg = sum(psnrs) / len(psnrs)
             print(f"evaluation: psnr_avg={psnr_avg}")

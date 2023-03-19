@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
-from .utils import Rays
+from .utils import Rays, ndc_rays
 
 _PATH = os.path.abspath(__file__)
 
@@ -98,7 +98,7 @@ def _load_colmap(root_fp: str, subject_id: str, factor: int = 1):
         params["k4"] = cam.k4
         camtype = "fisheye"
 
-    assert params is None, "Only support pinhole camera model."
+    # assert params is None, "Only support pinhole camera model."
 
     # Previous Nerf results were generated with images sorted by filename,
     # ensure metrics are reported on the same test set.
@@ -208,6 +208,9 @@ class SubjectLoader(torch.utils.data.Dataset):
         "kitchen",
         "room",
         "stump",
+        # LLFF
+        "fern",
+        "flower",
     ]
 
     OPENGL_CAMERA = False
@@ -224,6 +227,7 @@ class SubjectLoader(torch.utils.data.Dataset):
         batch_over_images: bool = True,
         factor: int = 1,
         device: str = "cpu",
+        ndc: bool = False,
     ):
         super().__init__()
         assert split in self.SPLITS, "%s" % split
@@ -245,6 +249,7 @@ class SubjectLoader(torch.utils.data.Dataset):
         T, sscale = similarity_from_cameras(
             self.camtoworlds, strict_scaling=False
         )
+        self.ndc = ndc
         self.camtoworlds = np.einsum("nij, ki -> nkj", self.camtoworlds, T)
         self.camtoworlds[:, :3, 3] *= sscale
         # split
@@ -347,6 +352,9 @@ class SubjectLoader(torch.utils.data.Dataset):
             directions, dim=-1, keepdims=True
         )
 
+        if self.ndc:
+            origins, viewdirs = ndc_rays(self.height, self.width, self.K[0][0], 1., origins, viewdirs)
+
         if self.training:
             origins = torch.reshape(origins, (num_rays, 3))
             viewdirs = torch.reshape(viewdirs, (num_rays, 3))
@@ -362,3 +370,67 @@ class SubjectLoader(torch.utils.data.Dataset):
             "rgb": rgb,  # [h, w, 3] or [num_rays, 3]
             "rays": rays,  # [h, w, 3] or [num_rays, 3]
         }
+
+    def cal_ndc_aabb(self):
+        aabb_min = torch.zeros(3, device=self.images.device)
+        aabb_max = torch.zeros(3, device=self.images.device)
+        for index in range(len(self.images)):
+            x, y = torch.meshgrid(
+                torch.tensor([0, self.width], device=self.images.device),
+                torch.tensor([0, self.height], device=self.images.device),
+                indexing="xy",
+            )
+            x = x.flatten()
+            y = y.flatten()
+
+            # print("x, y", x, y)
+
+            image_id = [index]
+
+            c2w = self.camtoworlds[image_id]  # (num_rays, 3, 4)
+            camera_dirs = F.pad(
+                torch.stack(
+                    [
+                        (x - self.K[0, 2] + 0.5) / self.K[0, 0],
+                        (y - self.K[1, 2] + 0.5)
+                        / self.K[1, 1]
+                        * (-1.0 if self.OPENGL_CAMERA else 1.0),
+                    ],
+                    dim=-1,
+                ),
+                (0, 1),
+                value=(-1.0 if self.OPENGL_CAMERA else 1.0),
+            )  # [num_rays, 3]
+
+            directions = (camera_dirs[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)
+            origins = torch.broadcast_to(c2w[:, :3, -1], directions.shape)
+            viewdirs = directions / torch.linalg.norm(
+                directions, dim=-1, keepdims=True
+            )
+
+            # print("before")
+            # print("origins: ", origins)
+            # print("viewdirs: ", viewdirs)
+
+            origins, viewdirs = ndc_rays(self.height, self.width, self.K[0][0], 1., origins, viewdirs)
+            ray_ends = origins + viewdirs
+
+            # print("after")
+            # print("origins: ", origins)
+            # print("ray_ends: ", ray_ends)
+
+            # print("viewdirs norm: ", torch.norm(viewdirs))
+
+            for i in range(origins.shape[0]):
+                aabb_min = torch.min(aabb_min, origins[i])
+                aabb_min = torch.min(aabb_min, ray_ends[i])
+                aabb_max = torch.max(aabb_max, origins[i])
+                aabb_max = torch.max(aabb_max, ray_ends[i])
+        
+        # print("AABB")
+        # print(aabb_min)
+        # print(aabb_max)
+
+        ret = torch.cat([aabb_min, aabb_max]).tolist()
+        # print(ret)
+        return ret

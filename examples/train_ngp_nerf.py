@@ -17,6 +17,7 @@ from radiance_fields.ngp import NGPRadianceField
 from utils import (
     MIPNERF360_UNBOUNDED_SCENES,
     NERF_SYNTHETIC_SCENES,
+    LLFF_SCENES,
     enlarge_aabb,
     render_image,
     set_random_seed,
@@ -40,6 +41,19 @@ parser.add_argument(
     help="which train split to use",
 )
 parser.add_argument(
+    "--model_path",
+    type=str,
+    default=None,
+    help="the data path of the pretrained model",
+)
+parser.add_argument(
+    "--dataset_type",
+    type=str,
+    default="blender",
+    choices=["blender", "llff", "360"],
+    help="which kind of dataset to use",
+)
+parser.add_argument(
     "--scene",
     type=str,
     default="lego",
@@ -56,73 +70,34 @@ args = parser.parse_args()
 device = "cuda:0"
 set_random_seed(42)
 
-<<<<<<< HEAD
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--data_root",
-        type=str,
-        default=str(pathlib.Path.cwd() / "data"),
-        help="the root dir of the dataset",
-    )
-    parser.add_argument(
-        "--train_split",
-        type=str,
-        default="trainval",
-        choices=["train", "trainval"],
-        help="which train split to use",
-    )
-    parser.add_argument(
-        "--scene",
-        type=str,
-        default="lego",
-        choices=[
-            # nerf synthetic
-            "chair",
-            "drums",
-            "ficus",
-            "hotdog",
-            "lego",
-            "materials",
-            "mic",
-            "ship",
-            # mipnerf360 unbounded
-            "garden",
-            "bicycle",
-            "bonsai",
-            "counter",
-            "kitchen",
-            "room",
-            "stump",
-        ],
-        help="which scene to use",
-    )
-    parser.add_argument(
-        "--aabb",
-        type=lambda s: [float(item) for item in s.split(",")],
-        default="-1.5,-1.5,-1.5,1.5,1.5,1.5",
-        help="delimited list input",
-    )
-    parser.add_argument(
-        "--test_chunk_size",
-        type=int,
-        default=8192,
-    )
-    parser.add_argument(
-        "--unbounded",
-        action="store_true",
-        help="whether to use unbounded rendering",
-    )
-    parser.add_argument(
-        "--auto_aabb",
-        action="store_true",
-        help="whether to automatically compute the aabb",
-    )
-    parser.add_argument("--cone_angle", type=float, default=0.0)
-    args = parser.parse_args()
-=======
-if args.scene in MIPNERF360_UNBOUNDED_SCENES:
+    # parser.add_argument(
+    #     "--aabb",
+    #     type=lambda s: [float(item) for item in s.split(",")],
+    #     default="-1.5,-1.5,-1.5,1.5,1.5,1.5",
+    #     help="delimited list input",
+    # )
+    # parser.add_argument(
+    #     "--unbounded",
+    #     action="store_true",
+    #     help="whether to use unbounded rendering",
+    # )
+    # parser.add_argument(
+    #     "--auto_aabb",
+    #     action="store_true",
+    #     help="whether to automatically compute the aabb",
+    # )
+
+
+if args.scene in LLFF_SCENES:
     from datasets.nerf_360_v2 import SubjectLoader
->>>>>>> 17e28de798dca5d2e2761ff8d514b8b4df26ef6f
+
+    target_sample_batch_size = 1 << 18
+    train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 4, "ndc": True}
+    test_dataset_kwargs = {"factor": 4, "ndc": True}
+    grid_resolution = 256
+
+elif args.scene in MIPNERF360_UNBOUNDED_SCENES:
+    from datasets.nerf_360_v2 import SubjectLoader
 
     # training parameters
     max_steps = 20000
@@ -169,33 +144,6 @@ else:
     alpha_thre = 0.0
     cone_angle = 0.0
 
-<<<<<<< HEAD
-        target_sample_batch_size = 1 << 20
-        train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 4}
-        test_dataset_kwargs = {"factor": 4}
-        grid_resolution = 256
-    else:
-        from datasets.nerf_synthetic import SubjectLoader
-
-        target_sample_batch_size = 1 << 18
-        grid_resolution = 128
-
-    train_dataset = SubjectLoader(
-        subject_id=args.scene,
-        root_fp=args.data_root,
-        split=args.train_split,
-        num_rays=target_sample_batch_size // render_n_samples,
-        **train_dataset_kwargs,
-    )
-
-    test_dataset = SubjectLoader(
-        subject_id=args.scene,
-        root_fp=args.data_root,
-        split="test",
-        num_rays=None,
-        **test_dataset_kwargs,
-    )
-=======
 train_dataset = SubjectLoader(
     subject_id=args.scene,
     root_fp=args.data_root,
@@ -243,10 +191,19 @@ occupancy_grid = OccupancyGrid(
     roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl
 ).to(device)
 
+if args.model_path is not None:
+    checkpoint = torch.load(args.model_path)
+    radiance_field.load_state_dict(checkpoint['radiance_field_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheluder_state_dict'])
+    occupancy_grid.load_state_dict(checkpoint['occupancy_grid_state_dict'])
+    step = checkpoint['step']
+else:
+    step = 0
+
 lpips_net = LPIPS(net="vgg").to(device)
 lpips_norm_fn = lambda x: x[None, ...].permute(0, 3, 1, 2) * 2 - 1
 lpips_fn = lambda x, y: lpips_net(lpips_norm_fn(x), lpips_norm_fn(y)).mean()
->>>>>>> 17e28de798dca5d2e2761ff8d514b8b4df26ef6f
 
 # training
 tic = time.time()
@@ -316,11 +273,21 @@ for step in range(max_steps + 1):
         )
 
     if step > 0 and step % max_steps == 0:
+        # save model
+        model_save_path = str(pathlib.Path.cwd() / f"mlp_nerf_{step}")
+        torch.save({'step': step, 
+                    'radiance_field_state_dict': radiance_field.state_dict(), 
+                    'optimizer_state_dict': optimizer.state_dict(), 
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'occupancy_grid_state_dict': occupancy_grid.state_dict(),
+                    }, model_save_path)
+
         # evaluation
         radiance_field.eval()
 
         psnrs = []
         lpips = []
+
         with torch.no_grad():
             for i in tqdm.tqdm(range(len(test_dataset))):
                 data = test_dataset[i]
@@ -328,7 +295,6 @@ for step in range(max_steps + 1):
                 rays = data["rays"]
                 pixels = data["pixels"]
 
-                # rendering
                 rgb, acc, depth, _ = render_image(
                     radiance_field,
                     occupancy_grid,
@@ -343,67 +309,15 @@ for step in range(max_steps + 1):
                     # test options
                     test_chunk_size=args.test_chunk_size,
                 )
-<<<<<<< HEAD
-
-            if step > 0 and step % max_steps == 0:
-                # evaluation
-                radiance_field.eval()
-
-                psnrs = []
-                with torch.no_grad():
-                    for i in tqdm.tqdm(range(len(test_dataset))):
-                        data = test_dataset[i]
-                        render_bkgd = data["color_bkgd"]
-                        rays = data["rays"]
-                        pixels = data["pixels"]
-
-                        # rendering
-                        rgb, acc, depth, _ = render_image(
-                            radiance_field,
-                            occupancy_grid,
-                            rays,
-                            scene_aabb,
-                            # rendering options
-                            near_plane=near_plane,
-                            far_plane=far_plane,
-                            render_step_size=render_step_size,
-                            render_bkgd=render_bkgd,
-                            cone_angle=args.cone_angle,
-                            alpha_thre=alpha_thre,
-                            # test options
-                            test_chunk_size=args.test_chunk_size,
-                        )
-                        mse = F.mse_loss(rgb, pixels)
-                        psnr = -10.0 * torch.log(mse) / np.log(10.0)
-                        psnrs.append(psnr.item())
-                        # imageio.imwrite(
-                        #     "acc_binary_test.png",
-                        #     ((acc > 0).float().cpu().numpy() * 255).astype(np.uint8),
-                        # )
-                        # imageio.imwrite(
-                        #     "rgb_test.png",
-                        #     (rgb.cpu().numpy() * 255).astype(np.uint8),
-                        # )
-                        # break
-                psnr_avg = sum(psnrs) / len(psnrs)
-                print(f"evaluation: psnr_avg={psnr_avg}")
-                train_dataset.training = True
-
-            if step == max_steps:
-                print("training stops")
-                exit()
-
-            step += 1
-=======
                 mse = F.mse_loss(rgb, pixels)
                 psnr = -10.0 * torch.log(mse) / np.log(10.0)
                 psnrs.append(psnr.item())
                 lpips.append(lpips_fn(rgb, pixels).item())
                 # if i == 0:
-                #     imageio.imwrite(
-                #         "rgb_test.png",
-                #         (rgb.cpu().numpy() * 255).astype(np.uint8),
-                #     )
+                imageio.imwrite(
+                    f"rgb_test_{i}.png",
+                    (rgb.cpu().numpy() * 255).astype(np.uint8),
+                )
                 #     imageio.imwrite(
                 #         "rgb_error.png",
                 #         (
@@ -413,4 +327,3 @@ for step in range(max_steps + 1):
         psnr_avg = sum(psnrs) / len(psnrs)
         lpips_avg = sum(lpips) / len(lpips)
         print(f"evaluation: psnr_avg={psnr_avg}, lpips_avg={lpips_avg}")
->>>>>>> 17e28de798dca5d2e2761ff8d514b8b4df26ef6f

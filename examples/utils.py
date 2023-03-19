@@ -32,6 +32,10 @@ MIPNERF360_UNBOUNDED_SCENES = [
     "room",
     "stump",
 ]
+LLFF_SCENES = [
+    "fern",
+    "flower"
+]
 
 
 def set_random_seed(seed):
