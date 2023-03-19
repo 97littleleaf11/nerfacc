@@ -79,7 +79,7 @@ class SubjectLoader(torch.utils.data.Dataset):
         near: float = None,
         far: float = None,
         batch_over_images: bool = True,
-        device: str = "cuda:0",
+        device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
         assert split in self.SPLITS, "%s" % split
@@ -123,6 +123,9 @@ class SubjectLoader(torch.utils.data.Dataset):
             dtype=torch.float32,
             device=device,
         )  # (3, 3)
+        self.images = self.images.to(device)
+        self.camtoworlds = self.camtoworlds.to(device)
+        self.K = self.K.to(device)
         assert self.images.shape[1:3] == (self.HEIGHT, self.WIDTH)
 
     def __len__(self):
